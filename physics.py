@@ -35,6 +35,8 @@ L2 = 1.0      # length of rod 2 [m]
 M1 = 1.0      # mass of bob 1 [kg]
 M2 = 1.0      # mass of bob 2 [kg]
 G  = 9.81     # gravitational acceleration [m/s^2]
+FRICTION_COEFF = 0.1  # viscous joint friction coefficient [N·m·s/rad]
+                      # -tau_friction = FRICTION_COEFF * omega  (per joint)
 
 # =============================================================================
 # Integration parameters
@@ -258,6 +260,10 @@ def derivatives(t, state, torque=None):
     # --- Build the 2x1 forcing vector ---
     f = build_forcing_vector(theta1, omega1, theta2, omega2)
 
+    # --- Add viscous friction at both joints: tau_f_i = -d * omega_i ---
+    f[0] -= FRICTION_COEFF * omega1
+    f[1] -= FRICTION_COEFF * omega2
+
     # --- Add external torques if provided ---
     if torque is not None:
         # tau is added directly to the generalized force vector
@@ -357,7 +363,7 @@ def positions_from_state(state):
 # Integration engine
 # =============================================================================
 
-def integrate_chunk(state, t_start, chunk_time=CHUNK_TIME, dt=DT_FRAME):
+def integrate_chunk(state, t_start, chunk_time=CHUNK_TIME, dt=DT_FRAME, deriv_fn=None):
     """
     Integrate the equations of motion forward by one time chunk.
 
@@ -380,12 +386,15 @@ def integrate_chunk(state, t_start, chunk_time=CHUNK_TIME, dt=DT_FRAME):
     t_array : ndarray   — evaluation times [s]
     y_array : ndarray, shape (n, 4)   — state at each time
     """
+    if deriv_fn is None:
+        deriv_fn = derivatives
+
     t_end = t_start + chunk_time
     n_points = max(int(chunk_time / dt), 2)
     t_eval = np.linspace(t_start, t_end, n_points + 1)
 
     sol = solve_ivp(
-        fun=derivatives,
+        fun=deriv_fn,
         t_span=(t_start, t_end),
         y0=state,
         method="DOP853",        # 8th-order Runge-Kutta (Dormand-Prince 8(5,3))
