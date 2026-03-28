@@ -8,12 +8,14 @@ Physics are imported from physics.py — this file handles only:
   - Interactive CLI for initial conditions
   - matplotlib animation loop
   - Trail rendering, energy readout, time display
+  - Torque and power time-series plots
 
 Run with:  python visualization.py
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from matplotlib.animation import FuncAnimation
 from collections import deque
 
@@ -22,20 +24,19 @@ from physics import (
     CHUNK_TIME, DT_FRAME,
     derivatives, compute_energy, positions_from_state, integrate_chunk,
 )
-from controller import LQRController, make_controlled_derivatives, snap_to_equilibrium
+from matplotlib.widgets import Button
+from controller import (
+    LQRController, HybridController,
+    snap_to_equilibrium, TAU_MAX,
+)
 
 # =============================================================================
 # Visualization parameters
 # =============================================================================
-TRAIL_LENGTH = 2000   # number of trail points to keep per bob
-
-
-# =============================================================================
-# Initial conditions  (hardcoded)
-# =============================================================================
-
-# θ₁ = θ₂ = 180° (both rods upright), ω₁ = 0 rad/s, ω₂ = 1 rad/s
-STATE0 = np.array([np.pi, 0.0, np.pi, 1.0])
+TRAIL_LENGTH  = 2000   # number of trail points to keep per bob
+HISTORY_LEN   = 500    # rolling torque/power history (~10 s at 50 fps)
+PUSH_TORQUE   = 15.0   # sustained push torque [N·m]
+PUSH_DURATION = 0.5    # how long a push lasts [s]
 
 
 def get_controller_target():
@@ -74,11 +75,7 @@ def run_simulation(state0, controller=None):
         If provided, the LQR torque is injected at every integrator sub-step
         via a closure over derivatives().  None = free (uncontrolled) simulation.
     """
-    # ---- Choose derivatives function ----
-    if controller is not None:
-        deriv_fn = make_controlled_derivatives(controller)
-    else:
-        deriv_fn = None   # integrate_chunk falls back to plain derivatives()
+    has_ctrl = controller is not None
 
     # ---- Mutable simulation state shared via closure ----
     sim = {
@@ -87,7 +84,18 @@ def run_simulation(state0, controller=None):
         "buffer_t": [],
         "buffer_y": [],
         "buf_idx": 0,
+        "push_torque_until": 0.0,   # timestamp when push torque expires
+        "push_torque_value": 0.0,   # push torque magnitude [N·m]
     }
+
+    # ---- Choose derivatives function (push-aware) ----
+    def deriv_fn(t, state):
+        torque = np.array([0.0, 0.0])
+        if controller is not None:
+            torque = controller(t, state)
+        if t < sim["push_torque_until"]:
+            torque[0] += sim["push_torque_value"]
+        return derivatives(t, state, torque=torque)
 
     # Trail storage
     trail1_x = deque(maxlen=TRAIL_LENGTH)
@@ -95,40 +103,84 @@ def run_simulation(state0, controller=None):
     trail2_x = deque(maxlen=TRAIL_LENGTH)
     trail2_y = deque(maxlen=TRAIL_LENGTH)
 
+    # Torque / power history
+    t_hist   = deque(maxlen=HISTORY_LEN)
+    tau_hist = deque(maxlen=HISTORY_LEN)
+    pwr_hist = deque(maxlen=HISTORY_LEN)
+
     def refill_buffer():
         """Integrate the next chunk and fill the frame buffer."""
-        t_arr, y_arr = integrate_chunk(sim["state"], sim["time"],
-                                       deriv_fn=deriv_fn)
-        # Skip first point if continuing (avoids duplicate with previous chunk end)
-        start = 1 if sim["time"] > 0 else 0
-        sim["buffer_t"] = t_arr[start:].tolist()
-        sim["buffer_y"] = y_arr[start:].tolist()
-        sim["buf_idx"] = 0
-        sim["state"] = y_arr[-1].copy()
-        sim["time"] = t_arr[-1]
+        MAX_RETRIES = 3
+        chunk = CHUNK_TIME
+        for attempt in range(MAX_RETRIES):
+            try:
+                t_arr, y_arr = integrate_chunk(sim["state"], sim["time"],
+                                               chunk_time=chunk, deriv_fn=deriv_fn)
+                start = 1 if sim["time"] > 0 else 0
+                sim["buffer_t"] = t_arr[start:].tolist()
+                sim["buffer_y"] = y_arr[start:].tolist()
+                sim["buf_idx"] = 0
+                sim["state"] = y_arr[-1].copy()
+                sim["time"] = t_arr[-1]
+                return
+            except RuntimeError as exc:
+                print(f"  [Integration] Retry {attempt+1}/{MAX_RETRIES}: {exc}")
+                chunk *= 0.5
+
+        # All retries failed — clamp velocities and try once more
+        print("  [Integration] Clamping state and retrying...")
+        MAX_OMEGA = 50.0
+        sim["state"][1] = np.clip(sim["state"][1], -MAX_OMEGA, MAX_OMEGA)
+        sim["state"][3] = np.clip(sim["state"][3], -MAX_OMEGA, MAX_OMEGA)
+        try:
+            t_arr, y_arr = integrate_chunk(sim["state"], sim["time"],
+                                           chunk_time=0.1, deriv_fn=deriv_fn)
+            start = 1 if sim["time"] > 0 else 0
+            sim["buffer_t"] = t_arr[start:].tolist()
+            sim["buffer_y"] = y_arr[start:].tolist()
+            sim["buf_idx"] = 0
+            sim["state"] = y_arr[-1].copy()
+            sim["time"] = t_arr[-1]
+        except RuntimeError:
+            # Last resort: hold state and advance time
+            print("  [Integration] FAILED — holding state, advancing time.")
+            dt = DT_FRAME
+            sim["buffer_t"] = [sim["time"] + dt]
+            sim["buffer_y"] = [sim["state"].tolist()]
+            sim["buf_idx"] = 0
+            sim["time"] += dt
 
     refill_buffer()  # pre-fill
 
     # ---- Set up matplotlib figure ----
-    has_ctrl = controller is not None
     title = (
-        f"Double Pendulum — LQR  target ({controller.theta1_target_deg:.0f}°,"
+        f"Double Pendulum — Swing-up + LQR  target"
+        f" ({controller.theta1_target_deg:.0f}°,"
         f" {controller.theta2_target_deg:.0f}°)"
         if has_ctrl else
         "Double Pendulum — Free Simulation (friction on)"
     )
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    fig = plt.figure(figsize=(14, 7))
+    fig.suptitle(title, fontsize=11)
+    gs = gridspec.GridSpec(2, 2, figure=fig,
+                           width_ratios=[1.1, 1],
+                           hspace=0.55, wspace=0.40)
+
+    ax      = fig.add_subplot(gs[:, 0])   # pendulum animation (full left column)
+    ax_tau  = fig.add_subplot(gs[0, 1])   # torque time series
+    ax_pwr  = fig.add_subplot(gs[1, 1])   # power time series
+
+    # ---- Pendulum axes ----
     ax.set_aspect("equal")
     lim = (L1 + L2) * 1.15
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
-    ax.set_title(title)
     ax.grid(True, alpha=0.3)
 
-    # Target marker (shown only when controller is active)
+    # Target marker
     if has_ctrl:
         from physics import positions_from_state as _pos
         _tgt = np.array([controller.theta1_eq, 0.0,
@@ -140,36 +192,80 @@ def run_simulation(state0, controller=None):
         ax.plot(_tx2, _ty2, "x", color="green", markersize=10,
                 markeredgewidth=2, zorder=3)
 
-    # Static elements
     ax.plot(0, 0, "ko", markersize=6, zorder=5)   # pivot
 
-    # Dynamic elements (initially empty)
-    rod_line, = ax.plot([], [], "k-", linewidth=2, zorder=4)
-    bob1_dot, = ax.plot([], [], "o", color="royalblue", markersize=12,
-                        markeredgecolor="black", zorder=5)
-    bob2_dot, = ax.plot([], [], "o", color="crimson", markersize=12,
-                        markeredgecolor="black", zorder=5)
-    trail1_line, = ax.plot([], [], "-", color="royalblue", linewidth=0.8,
-                           alpha=0.6, zorder=2)
-    trail2_line, = ax.plot([], [], "-", color="crimson", linewidth=0.8,
-                           alpha=0.6, zorder=2)
+    rod_line,  = ax.plot([], [], "k-", linewidth=2, zorder=4)
+    bob1_dot,  = ax.plot([], [], "o", color="royalblue", markersize=12,
+                         markeredgecolor="black", zorder=5)
+    bob2_dot,  = ax.plot([], [], "o", color="crimson", markersize=12,
+                         markeredgecolor="black", zorder=5)
+    trail1_ln, = ax.plot([], [], "-", color="royalblue", linewidth=0.8,
+                         alpha=0.6, zorder=2)
+    trail2_ln, = ax.plot([], [], "-", color="crimson", linewidth=0.8,
+                         alpha=0.6, zorder=2)
 
-    time_text = ax.text(0.02, 0.98, "", transform=ax.transAxes, fontsize=10,
-                        verticalalignment="top", fontfamily="monospace",
-                        bbox=dict(boxstyle="round,pad=0.3",
-                                  facecolor="wheat", alpha=0.8))
+    time_text   = ax.text(0.02, 0.98, "", transform=ax.transAxes, fontsize=10,
+                          verticalalignment="top", fontfamily="monospace",
+                          bbox=dict(boxstyle="round,pad=0.3",
+                                    facecolor="wheat", alpha=0.8))
     energy_text = ax.text(0.02, 0.82, "", transform=ax.transAxes, fontsize=9,
                           verticalalignment="top", fontfamily="monospace",
                           bbox=dict(boxstyle="round,pad=0.3",
                                     facecolor="lightyellow", alpha=0.8))
-    ctrl_text = ax.text(0.98, 0.98, "", transform=ax.transAxes, fontsize=9,
-                        verticalalignment="top", horizontalalignment="right",
-                        fontfamily="monospace",
-                        bbox=dict(boxstyle="round,pad=0.3",
-                                  facecolor="lightgreen", alpha=0.8))
+    ctrl_text   = ax.text(0.98, 0.98, "", transform=ax.transAxes, fontsize=9,
+                          verticalalignment="top", horizontalalignment="right",
+                          fontfamily="monospace",
+                          bbox=dict(boxstyle="round,pad=0.3",
+                                    facecolor="lightgreen", alpha=0.8))
 
-    artists = (rod_line, bob1_dot, bob2_dot, trail1_line, trail2_line,
-               time_text, energy_text, ctrl_text)
+    # ---- Torque axes ----
+    ax_tau.set_xlim(0, HISTORY_LEN * DT_FRAME)
+    ax_tau.set_ylim(-TAU_MAX * 1.1, TAU_MAX * 1.1)
+    ax_tau.axhline(0, color="gray", linewidth=0.6, linestyle="--")
+    ax_tau.axhline( TAU_MAX, color="salmon", linewidth=0.8, linestyle=":")
+    ax_tau.axhline(-TAU_MAX, color="salmon", linewidth=0.8, linestyle=":")
+    ax_tau.set_xlabel("time window [s]")
+    ax_tau.set_ylabel("τ₁ [N·m]")
+    ax_tau.set_title("Joint-1 torque")
+    ax_tau.grid(True, alpha=0.3)
+    tau_line, = ax_tau.plot([], [], color="darkorange", linewidth=1.2)
+
+    # ---- Power axes ----
+    PWR_LIM = TAU_MAX * 8.0   # generous initial y-limit
+    ax_pwr.set_xlim(0, HISTORY_LEN * DT_FRAME)
+    ax_pwr.set_ylim(-PWR_LIM, PWR_LIM)
+    ax_pwr.axhline(0, color="gray", linewidth=0.6, linestyle="--")
+    ax_pwr.set_xlabel("time window [s]")
+    ax_pwr.set_ylabel("P [W]")
+    ax_pwr.set_title("Joint-1 power  (τ₁ · ω₁)")
+    ax_pwr.grid(True, alpha=0.3)
+    pwr_line, = ax_pwr.plot([], [], color="mediumpurple", linewidth=1.2)
+
+    # ---- Push button ----
+    # Leaves a strip at the bottom of the figure for the button.
+    # We call tight_layout with rect later to keep axes clear of it.
+    ax_push = fig.add_axes([0.02, 0.01, 0.16, 0.055])
+    push_btn = Button(ax_push, 'Push  [P / Space]',
+                      color='lightcoral', hovercolor='tomato')
+
+    def apply_push(event=None):
+        """Queue a sustained torque push on rod 1."""
+        sim["push_torque_until"] = sim["time"] + PUSH_DURATION
+        sim["push_torque_value"] = PUSH_TORQUE
+        # Clear buffer so integration restarts with push torque active
+        sim["buffer_t"] = []
+        sim["buffer_y"] = []
+        sim["buf_idx"] = 0
+
+    push_btn.on_clicked(apply_push)
+    fig.canvas.mpl_connect(
+        'key_press_event',
+        lambda e: apply_push() if e.key in ('p', ' ') else None
+    )
+
+    artists = (rod_line, bob1_dot, bob2_dot, trail1_ln, trail2_ln,
+               time_text, energy_text, ctrl_text,
+               tau_line, pwr_line)
 
     def init():
         for a in artists:
@@ -183,16 +279,18 @@ def run_simulation(state0, controller=None):
         # Refill if buffer exhausted
         if sim["buf_idx"] >= len(sim["buffer_t"]):
             refill_buffer()
+        if len(sim["buffer_t"]) == 0:
+            return artists
 
-        idx = sim["buf_idx"]
-        t_now = sim["buffer_t"][idx]
-        state_now = np.array(sim["buffer_y"][idx])
+        idx        = sim["buf_idx"]
+        t_now      = sim["buffer_t"][idx]
+        state_now  = np.array(sim["buffer_y"][idx])
         sim["buf_idx"] = idx + 1
 
         # Cartesian positions
         x1, y1, x2, y2 = positions_from_state(state_now)
 
-        # Rods: pivot -> bob1 -> bob2
+        # Rods
         rod_line.set_data([0, x1, x2], [0, y1, y2])
         bob1_dot.set_data([x1], [y1])
         bob2_dot.set_data([x2], [y2])
@@ -200,12 +298,11 @@ def run_simulation(state0, controller=None):
         # Trails
         trail1_x.append(x1); trail1_y.append(y1)
         trail2_x.append(x2); trail2_y.append(y2)
-        trail1_line.set_data(list(trail1_x), list(trail1_y))
-        trail2_line.set_data(list(trail2_x), list(trail2_y))
+        trail1_ln.set_data(list(trail1_x), list(trail1_y))
+        trail2_ln.set_data(list(trail2_x), list(trail2_y))
 
-        # Energy (no drift warning — friction dissipates energy intentionally)
+        # Energy
         T, V, E = compute_energy(state_now)
-
         time_text.set_text(f"t = {t_now:8.3f} s")
         energy_text.set_text(
             f"KE  = {T:+10.5f} J\n"
@@ -213,33 +310,51 @@ def run_simulation(state0, controller=None):
             f"Tot = {E:+10.5f} J"
         )
 
-        # Controller readout
+        # Controller readout + torque/power history
+        theta1, omega1, theta2, omega2 = state_now
         if has_ctrl:
             tau = controller.last_tau
-            import numpy as _np
-            phi1 = float(_np.degrees(state_now[0]) - controller.theta1_target_deg)
-            phi2 = float(_np.degrees(state_now[2]) - controller.theta2_target_deg)
-            # wrap to [-180, 180]
-            phi1 = (phi1 + 180) % 360 - 180
-            phi2 = (phi2 + 180) % 360 - 180
+            phi1 = (np.degrees(theta1) - controller.theta1_target_deg + 180) % 360 - 180
+            phi2 = (np.degrees(theta2) - controller.theta2_target_deg + 180) % 360 - 180
+            mode = getattr(controller, 'mode', 'lqr').upper()
             ctrl_text.set_text(
-                f"LQR τ₁ = {tau:+7.2f} N·m\n"
+                f"[{mode}] τ₁ = {tau:+7.2f} N·m\n"
                 f"φ₁   = {phi1:+7.2f}°\n"
                 f"φ₂   = {phi2:+7.2f}°"
             )
         else:
+            tau = 0.0
             ctrl_text.set_text("controller: OFF")
+
+        power = tau * omega1
+
+        # Rolling time axis: shift so latest point is at right edge
+        t_hist.append(t_now)
+        tau_hist.append(tau)
+        pwr_hist.append(power)
+
+        t_arr  = np.array(t_hist)
+        t_rel  = t_arr - t_arr[-1] + HISTORY_LEN * DT_FRAME  # shift to window
+
+        tau_line.set_data(t_rel, list(tau_hist))
+        pwr_line.set_data(t_rel, list(pwr_hist))
+
+        # Auto-scale power y-axis if needed (no blit issue since limits reset each frame)
+        if len(pwr_hist) > 1:
+            p_max = max(abs(p) for p in pwr_hist) * 1.2 or PWR_LIM
+            if p_max > PWR_LIM:
+                ax_pwr.set_ylim(-p_max, p_max)
 
         return artists
 
     _anim = FuncAnimation(
         fig, update, init_func=init,
         interval=DT_FRAME * 1000,
-        blit=True,
+        blit=False,          # False so axis rescaling works
         cache_frame_data=False,
     )
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.08, 1, 1])   # leave bottom strip for push button
     plt.show()
 
 
@@ -248,16 +363,16 @@ def run_simulation(state0, controller=None):
 # =============================================================================
 
 def main():
-    state0 = STATE0.copy()
+    t1_target, t2_target = get_controller_target()
+
+    state0 = np.array([np.pi / 2, 0.0, np.pi / 2, 0.0])
     print(f"  θ₁={np.degrees(state0[0]):.0f}°  ω₁={state0[1]:.2f} rad/s  "
           f"θ₂={np.degrees(state0[2]):.0f}°  ω₂={state0[3]:.2f} rad/s")
-
-    t1_target, t2_target = get_controller_target()
 
     controller = None
     if t1_target is not None:
         try:
-            controller = LQRController(t1_target, t2_target)
+            controller = HybridController(t1_target, t2_target)
         except ValueError as exc:
             print(f"  [Controller] ERROR: {exc} — running without controller.")
 
