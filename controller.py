@@ -43,8 +43,6 @@ R_DEFAULT = np.array([[0.05]])
 # ---------------------------------------------------------------------------
 # Helper: snap an angle [deg] to the nearest equilibrium (0° or 180°)
 # ---------------------------------------------------------------------------
-EQUILIBRIA_DEG = np.array([0.0, 180.0])
-
 
 def snap_to_equilibrium(angle_deg: float) -> float:
     """Return 0.0 or 180.0, whichever is closer to angle_deg (mod 360)."""
