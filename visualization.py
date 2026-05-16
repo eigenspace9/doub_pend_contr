@@ -127,11 +127,17 @@ def run_simulation(state0, controller=None):
                 print(f"  [Integration] Retry {attempt+1}/{MAX_RETRIES}: {exc}")
                 chunk *= 0.5
 
-        # All retries failed — clamp velocities and try once more
+        # All retries failed — sanitize full state and try once more
         print("  [Integration] Clamping state and retrying...")
         MAX_OMEGA = 50.0
-        sim["state"][1] = np.clip(sim["state"][1], -MAX_OMEGA, MAX_OMEGA)
-        sim["state"][3] = np.clip(sim["state"][3], -MAX_OMEGA, MAX_OMEGA)
+        state = sim["state"]
+        # Replace NaN/Inf in angles with last finite value or 0
+        for i in (0, 2):
+            if not np.isfinite(state[i]):
+                state[i] = 0.0
+        state[1] = np.clip(state[1] if np.isfinite(state[1]) else 0.0, -MAX_OMEGA, MAX_OMEGA)
+        state[3] = np.clip(state[3] if np.isfinite(state[3]) else 0.0, -MAX_OMEGA, MAX_OMEGA)
+        sim["state"] = state
         try:
             t_arr, y_arr = integrate_chunk(sim["state"], sim["time"],
                                            chunk_time=0.1, deriv_fn=deriv_fn)
@@ -231,9 +237,9 @@ def run_simulation(state0, controller=None):
     tau_line, = ax_tau.plot([], [], color="darkorange", linewidth=1.2)
 
     # ---- Power axes ----
-    PWR_LIM = TAU_MAX * 8.0   # generous initial y-limit
+    PWR_LIM = [TAU_MAX * 8.0]   # mutable so update() can expand it without nonlocal
     ax_pwr.set_xlim(0, HISTORY_LEN * DT_FRAME)
-    ax_pwr.set_ylim(-PWR_LIM, PWR_LIM)
+    ax_pwr.set_ylim(-PWR_LIM[0], PWR_LIM[0])
     ax_pwr.axhline(0, color="gray", linewidth=0.6, linestyle="--")
     ax_pwr.set_xlabel("time window [s]")
     ax_pwr.set_ylabel("P [W]")
@@ -339,10 +345,11 @@ def run_simulation(state0, controller=None):
         tau_line.set_data(t_rel, list(tau_hist))
         pwr_line.set_data(t_rel, list(pwr_hist))
 
-        # Auto-scale power y-axis if needed (no blit issue since limits reset each frame)
+        # Auto-scale power y-axis only when the limit actually needs to grow
         if len(pwr_hist) > 1:
-            p_max = max(abs(p) for p in pwr_hist) * 1.2 or PWR_LIM
-            if p_max > PWR_LIM:
+            p_max = max(abs(p) for p in pwr_hist) * 1.2 or PWR_LIM[0]
+            if p_max > PWR_LIM[0]:
+                PWR_LIM[0] = p_max
                 ax_pwr.set_ylim(-p_max, p_max)
 
         return artists
